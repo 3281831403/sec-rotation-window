@@ -55,7 +55,7 @@ def _format_time(value: datetime) -> str:
 
 
 def _time_le(left: Any, right: Any) -> bool:
-    return str(left) <= str(right)
+    return _parse_time(left) <= _parse_time(right)
 
 
 def _overlap_days(policy: Any) -> int:
@@ -97,6 +97,10 @@ def register(store: dict, key_id: str, created_at: str, policy: dict) -> dict:
 
     records = store.setdefault("keys", [])
     store["policy"] = policy
+
+    if _find(store, key_id) is not None:
+        return _fail("duplicate_key")
+
     record = {
         "key_id": key_id,
         "created_at": created_at,
@@ -104,13 +108,6 @@ def register(store: dict, key_id: str, created_at: str, policy: dict) -> dict:
         "activated_at": None,
         "retired_at": None,
     }
-
-    existing = _find(store, key_id)
-    if existing is not None:
-        existing.clear()
-        existing.update(record)
-        return _ok(existing)
-
     records.append(record)
     return _ok(record)
 
@@ -121,29 +118,47 @@ def activate(store: dict, key_id: str, now: str) -> dict:
     if record is None:
         return _fail("unknown_key")
 
+    moment = _parse_time(now)
     record["effective_at"] = now
     record["activated_at"] = now
     record["retired_at"] = None
     store["active_id"] = key_id
 
+    # The old key stays usable for the policy-defined overlap window: its
+    # retirement takes effect only after the new key is already effective.
+    overlap = _overlap_days(store.get("policy"))
+    retired_at = _format_time(moment + timedelta(days=overlap))
     for other in store.get("keys", []):
         if other is record:
             continue
-        other["retired_at"] = now
+        if other.get("retired_at") is None:
+            other["retired_at"] = retired_at
 
     return _ok(record)
 
 
 def select(store: dict, now: str) -> dict:
     """Select the key that should serve a request made at the given time."""
-    candidates = [
-        record
-        for record in store.get("keys", [])
-        if record.get("effective_at") is not None
-        and _time_le(record.get("effective_at"), now)
-    ]
+    current = _parse_time(now)
+    candidates = []
+    for record in store.get("keys", []):
+        effective_at = record.get("effective_at")
+        if effective_at is None or _parse_time(effective_at) > current:
+            continue
+        retired_at = record.get("retired_at")
+        if retired_at is not None and _parse_time(retired_at) <= current:
+            continue
+        candidates.append(record)
     if not candidates:
         return _fail("no_usable_key")
+    # Most recently effective key wins; key_id tie-break keeps the choice
+    # deterministic regardless of registration or rotation order.
+    candidates.sort(
+        key=lambda record: (
+            _parse_time(record["effective_at"]),
+            str(record.get("key_id")),
+        )
+    )
     return _ok(candidates[-1])
 
 
@@ -153,7 +168,7 @@ def retire(store: dict, key_id: str, now: str) -> dict:
     if record is None:
         return _fail("unknown_key")
 
-    record["retire_requested_at"] = now
+    record["retired_at"] = now
     if store.get("active_id") == key_id:
         store["active_id"] = None
     return _ok(record)
@@ -166,7 +181,8 @@ def overlap_ok(store: dict, now: str, policy: dict) -> bool:
         return False
     start = _parse_time(active["activated_at"])
     current = _parse_time(now)
-    return start <= current < start + timedelta(days=7)
+    days = _overlap_days(policy if policy is not None else store.get("policy"))
+    return start <= current < start + timedelta(days=days)
 
 
 def validate_store(store: dict) -> list[str]:
@@ -196,25 +212,35 @@ def validate_store(store: dict) -> list[str]:
 
 def purge_expired(store: dict, now: str) -> int:
     """Remove records whose retirement time has passed and return the count."""
+    current = _parse_time(now)
     records = store.get("keys", [])
+    kept = []
     expired = 0
     for record in records:
         retired_at = record.get("retired_at")
-        if retired_at is not None and _time_le(retired_at, now):
+        if retired_at is not None and _parse_time(retired_at) <= current:
             expired += 1
+        else:
+            kept.append(record)
+    if expired:
+        store["keys"] = kept
+        if _find(store, store.get("active_id")) is None:
+            store["active_id"] = None
     return expired
 
 
 def window_batch(requests: list[dict], policy: dict) -> dict:
     """Answer several independent selection requests."""
-    if not requests:
-        return {"results": []}
-
-    first = requests[0]
-    selection = select(first["store"], first["now"])
-    shared = {
-        "ok": selection["ok"],
-        "key": _copy(selection["key"]),
-        "overlap": overlap_ok(first["store"], first["now"], policy),
-    }
-    return {"results": [shared for _ in requests]}
+    results = []
+    for request in requests:
+        store = request["store"]
+        now = request["now"]
+        selection = select(store, now)
+        results.append(
+            {
+                "ok": selection["ok"],
+                "key": _copy(selection["key"]),
+                "overlap": overlap_ok(store, now, policy),
+            }
+        )
+    return {"results": results}
